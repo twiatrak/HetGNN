@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data artifacts / caches
+data/WikipediaNetwork/
+data/exports/
+
+# IDE / editor
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

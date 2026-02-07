@@ -1,0 +1,13 @@
+# Core
+numpy>=1.24
+scipy>=1.10
+networkx>=3.0
+tqdm>=4.66
+pyyaml>=6.0
+
+# ML (install separately if needed)
+# torch
+# torch_geometric
+# torch_scatter
+# torch_sparse
+# pyg_lib

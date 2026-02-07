@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hetgnn-spectral-stability"
+version = "0.1.0"
+description = "Research scaffold: stochastic rewiring + spectral stability regularization for heterophilic GNNs"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Your Name"}]
+license = {text = "MIT"}
+
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "networkx>=3.0",
+  "tqdm>=4.66",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Intentionally left minimal: PyG/Torch wheels are platform/CUDA specific.
+ml = [
+  "torch",
+  "torch-geometric",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

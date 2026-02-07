@@ -1,0 +1,8 @@
+# NOTE: These installs are platform/CUDA specific.
+# Prefer the official PyG install selector for the correct wheel set.
+
+torch
+# torch-geometric
+# torch-scatter
+# torch-sparse
+# pyg-lib
