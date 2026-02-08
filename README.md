@@ -1,75 +1,86 @@
-# Stochastic Spectral Stability (S3): Self-Healing Graph Neural Networks
+# Stochastic Spectral Stability for Heterophilic GNNs
 
-Part 1: Project README.md (The "Thesis Edition")
+Learning task-optimized graph topologies with spectral stability guarantees under structural perturbation.
 
-This draft summarizes the research for colleagues or reviewers. This repository implements the S3 Framework, a system for learning task-optimized graph topologies that are mathematically guaranteed to remain stable under structural attacks.
+## Overview
 
-Core Research Contribution
+Standard GNNs are fragile to edge deletions — removing a small fraction of critical edges can fragment the graph and collapse predictive accuracy. This framework addresses the problem by jointly learning a stochastic graph topology and enforcing algebraic connectivity constraints via primal-dual optimization.
 
-Standard GNNs suffer from a structural cliff: if critical edges are removed, the graph fragments and predictive power collapses. S3 solves this by treating the Spectral Stability Index (SSI) as a differentiable risk measure.
+**Key components:**
 
-Key Mechanisms
+- **Stochastic rewiring** — Gumbel-Sigmoid edge gates that learn a task-conditioned topology over a candidate edge pool (original edges + KNN additions).
+- **Primal-dual constraint enforcement** — Lagrangian multipliers enforce a lower bound on $\lambda_2$ (algebraic connectivity) and edge-budget guardrails during training.
+- **Test-time adaptation (TTA)** — At inference, a dual-ascent loop rewires the frozen model's topology to recover from structural shocks without retraining.
 
-- Stochastic Rewiring: A Gumbel-Softmax layer that learns an optimal topology via probabilistic gates.
-- Primal-Dual Constraint Engine: Uses Lagrangian multipliers ($\mu$) to automatically enforce algebraic connectivity ($\lambda_2$) and edge-budget guardrails.
-- Test-Time Adaptation (TTA): A self-healing loop that lets a frozen GNN rewire its topology at inference time to recover from structural shocks.
+## Installation
 
-Final Technical Audit: The Seals Are Holding
+```bash
+pip install -e .
+# PyTorch and PyG must be installed separately (platform/CUDA-specific):
+pip install torch torch-geometric
+```
 
-- Sensor Fix: SSISensor now applies the 0.5 factor for symmetric double-counting and uses log-mean-exp aggregation to avoid negative-estimate bias on fragmented graphs.
-- Actuator Fix: self_healing_step performs a true primal update on the gate MLP, so TTA physically rewires the topology.
-- Temperature Consistency: expected_num_edges and expected_keep_rate use temperature-scaled sigmoid probabilities, aligning budget constraints with deterministic weights.
-- Unified Configuration: config.py centralizes training and adaptation settings for reproducible experiments.
+Requires Python $\geq$ 3.10.
 
-Empirical Breakthrough: The 20% Attack Victory
+## Usage
 
-On the heterophilic chameleon dataset, we identified a Resilience Zone:
+Train on Chameleon (heterophilic node classification) with spectral constraints:
 
-- The Baseline Collapse: A standard WSAGE model loses significant accuracy when the top 20% of connectivity-critical edges are deleted.
-- The S3 Resilience: Our model maintains a 3.5% absolute accuracy lead by physically re-routing signals and achieving a 1.03x recovery of its spectral health.
+```bash
+python scripts/run_nodecls_wikipedia.py \
+  --dataset chameleon --epochs 100 --warmup-epochs 20 \
+  --add-knn 10 --anchor-knn 10 \
+  --alpha-conn 1.0 --conn-eps 0.2 \
+  --edge-budget-min-ratio 0.6 --edge-budget-max-ratio 1.4 \
+  --dual-lr 0.02 --cvar-samples 10 --cvar-frac 0.5
+```
 
-Resilience Victory (Headline Results)
+Evaluate with targeted spectral attack and three-way comparison (baseline / frozen / TTA-healed):
 
-- Collapse: Removing the top 20% of connectivity-critical edges causes standard backbones (WSAGE/GCN) to suffer a catastrophic accuracy drop.
-- S3 Edge: The model preserves a 3.5% absolute accuracy lead over the baseline.
-- Healing Signature: SSI Recovery Ratio reaches 1.03x while respecting the edge budget.
+```bash
+python scripts/run_nodecls_wikipedia.py \
+  --dataset chameleon --epochs 100 --warmup-epochs 20 \
+  --add-knn 10 --anchor-knn 10 \
+  --alpha-conn 1.0 --conn-eps 0.2 \
+  --edge-budget-min-ratio 0.6 --edge-budget-max-ratio 1.4 \
+  --dual-lr 0.02 --cvar-samples 10 --cvar-frac 0.5 \
+  --zero-shot-shock --targeted-spectral-attack --attack-pct 0.15 \
+  --shock-samples 200 --shock-cvar-frac 0.2 --shock-reset-duals \
+  --tta-healing-steps 20 --tta-dual-lr 0.01 \
+  --comparative-eval \
+  --log-csv data/metrics/results.csv
+```
 
-Discussion Draft: The Role of KL-Consistency
+## Project Structure
 
-A critical challenge in self-healing graph topologies is the over-smoothing trade-off. Forcing connectivity under attack can introduce noise from label-disagreeing neighbors, which is especially harmful on heterophilic datasets like chameleon. We address this by adding a prediction consistency loss (KL divergence) during TTA. The loss anchors node predictions to their pre-shock state, allowing the model to restore spectral stability ($\lambda_2$) while preventing the topology from washing out the classifier's decision boundaries. The resulting 3.5% lead over standard backbones shows that global stability can be restored without sacrificing local signal purity.
+```
+src/hetgnn_spectral_stability/
+├── config.py                        # Centralized hyperparameter configuration
+├── layers/
+│   └── stochastic_rewire.py         # Gumbel-Sigmoid edge gates with temperature control
+├── models/
+│   └── simple_model.py              # Primal-dual GNN with augmented Lagrangian
+└── regularizers/
+    └── spectral.py                  # Rayleigh-quotient estimators for normalized λ₂
 
-Project Structure
+scripts/
+├── run_nodecls_wikipedia.py         # Training + evaluation (attack, TTA, 3-way comparison)
+└── validation_checks.py            # Spectral invariant and actuator sanity checks
 
-- [src/hetgnn_spectral_stability/regularizers/spectral.py](src/hetgnn_spectral_stability/regularizers/spectral.py): Calibrated Rayleigh-quotient estimators for normalized $\lambda_2$.
-- [src/hetgnn_spectral_stability/layers/stochastic_rewire.py](src/hetgnn_spectral_stability/layers/stochastic_rewire.py): Temperature-consistent Bernoulli gates for differentiable pruning.
-- [src/hetgnn_spectral_stability/models/simple_model.py](src/hetgnn_spectral_stability/models/simple_model.py): Primal-dual architecture with augmented Lagrangian penalties.
-- [scripts/validation_checks.py](scripts/validation_checks.py): Three-tier mathematical validation suite (invariants, spectral sanity, actuator check).
+docs/
+└── research_foundations.md          # Mathematical background and derivations
+```
 
-Part 2: The "Final Polish" Cleanup Prompt
+## Method
 
-Use this prompt to have an AI (like GPT-5.2 Pro) refactor and sanitize the code for final submission.
+The training objective combines task loss with spectral and budget constraints enforced via dual variables:
 
-Role: You are a Senior Research Engineer at DeepMind/OpenAI specializing in Graph ML infrastructure.
+$$\min_\theta \; \mathbb{E}_{M \sim \theta}\!\left[\mathcal{L}_{\text{task}}\right] + \mu_{\lambda_2} \max(0,\; \epsilon - \hat\lambda_2)^2 + \mu_{\text{budget}} \cdot g(\text{edge ratio})$$
 
-Goal: Clean up the provided repository to meet NeurIPS/ICML 2026 production standards.
+where $\hat\lambda_2$ is estimated via min-Rayleigh-quotient on the stochastic graph snapshot and $\mu$ values are updated by dual ascent.
 
-Specific Refactoring Instructions
+At test time, the TTA loop freezes model weights and performs dual ascent over the topology gates to restore $\lambda_2$ after edge deletion, producing a **SSI Recovery Ratio** $= \lambda_2^{\text{post}} / \lambda_2^{\text{pre}}$ as the primary resilience metric.
 
-- Eliminate Spectral Redundancy: The $\lambda_2$ estimation logic is currently duplicated in spectral.py and manually implemented inside run_nodecls_wikipedia.py. Centralize this into a single, high-stability SSI_Sensor class.
-- Harmonize Hyperparameters: Move the RegularizationConfig and the TTA parameters into a unified YAML-based configuration handler to prevent command-line fatigue.
-- Sanitize Monitoring Snapshots: Ensure the compute_rewired_snapshot function consistently receives the anchor_edge_index across all logging calls to eliminate the monitoring blind spot.
-- Enforce Type Hints: Ensure all tensors have strict shape documentation (e.g., Tensor  # [2, E_pool]) to help other researchers audit the symmetric pooling logic.
-- Logging Precision: Refactor the CSV logger to separate training statistics from spectral risk statistics (SSI) to make plotting the Pareto Frontier easier.
+## License
 
-Part 3: Final Deep Clean Prompt (Optional)
-
-Role: You are a Lead Research Engineer specializing in Differentiable Topology and Graph ML.
-
-Goal: Perform a final deep clean of the provided S3 Framework to meet NeurIPS 2026 production standards.
-
-Tasks
-
-- Docstring Perfection: Ensure all functions in spectral.py and stochastic_rewire.py have NumPy-style docstrings with explicit Args, Returns, and Notes sections.
-- Constraint Hardening: In self_healing_step, ensure that if the budget max ratio is exceeded, the spectral healing signal is dampened to prevent densification cheats.
-- Logging Granularity: Update the CSV logger to track dual_spectral pressure separately from train_acc so the response signature can be plotted against attack magnitude.
-- Device Hygiene: Verify that all tensor creations use the correct device to prevent CPU/GPU mismatch in large-scale runs.
+MIT
