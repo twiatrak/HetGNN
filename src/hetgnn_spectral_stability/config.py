@@ -17,8 +17,16 @@ class RegularizationConfig:
     alpha_edge_budget: float = 0.0
     edge_budget_min_ratio: float = 0.6
     edge_budget_max_ratio: float = 1.4
-    # Anchor "stability" penalty (tracks whether anchors were actually enforced).
+    # Anchor handling: "forced" (gates=1, coverage metric) or "soft" (learnable penalty).
+    anchor_mode: str = "soft"
     alpha_anchor_stability: float = 0.0
+    # Band-energy (heterophily-aware frequency preservation).
+    alpha_band_high: float = 0.0
+    band_target_high_ratio: float = 0.25
+    band_cheby_order: int = 4
+    # Variance floor (prevents representation collapse).
+    alpha_variance_floor: float = 0.0
+    variance_floor: float = 1e-2
     # Primal-dual control knobs.
     dual_lr: float = 1e-2
     cvar_samples: int = 4

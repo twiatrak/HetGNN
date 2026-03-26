@@ -429,6 +429,87 @@ def lambda2_scipy(
     return float(vals[1])
 
 
+# ---------------------------------------------------------------------------
+# Band-energy proxy via Chebyshev polynomials of the normalized Laplacian
+# ---------------------------------------------------------------------------
+
+def _normalized_laplacian_matvec(
+    edge_index: Tensor,
+    edge_weight: Optional[Tensor],
+    x: Tensor,
+    num_nodes: int,
+    eps: float = 1e-12,
+) -> Tensor:
+    """Compute L_sym @ x where L_sym = I - D^{-1/2} A D^{-1/2}."""
+    row, col = edge_index
+    if edge_weight is None:
+        edge_weight = torch.ones(edge_index.size(1), device=x.device, dtype=x.dtype)
+
+    deg = torch.zeros(num_nodes, device=x.device, dtype=x.dtype)
+    deg.scatter_add_(0, row, edge_weight)
+    inv_sqrt_deg = deg.clamp_min(eps).rsqrt()
+
+    # A D^{-1/2} x
+    x_scaled = x * inv_sqrt_deg.unsqueeze(-1) if x.dim() == 2 else x * inv_sqrt_deg
+    msg = x_scaled[col] * edge_weight.unsqueeze(-1) if x.dim() == 2 else x_scaled[col] * edge_weight
+    agg = torch.zeros_like(x)
+    if x.dim() == 2:
+        agg.scatter_add_(0, row.unsqueeze(-1).expand_as(msg), msg)
+    else:
+        agg.scatter_add_(0, row, msg)
+    # D^{-1/2} A D^{-1/2} x
+    agg = agg * inv_sqrt_deg.unsqueeze(-1) if x.dim() == 2 else agg * inv_sqrt_deg
+    return x - agg
+
+
+def _chebyshev_basis(
+    Lx_fn,
+    x: Tensor,
+    order: int,
+) -> list:
+    """Compute Chebyshev polynomials T_0(L)x, T_1(L)x, ..., T_{order}(L)x.
+
+    Uses the recurrence T_0(L)x = x, T_1(L)x = Lx, T_{k+1} = 2L T_k - T_{k-1}.
+    Note: assumes eigenvalues in [0, 2] (normalized Laplacian); no rescaling needed.
+    """
+    basis = [x]
+    if order < 1:
+        return basis
+    Lx = Lx_fn(x)
+    basis.append(Lx)
+    for _ in range(2, order + 1):
+        Lx_new = 2.0 * Lx_fn(basis[-1]) - basis[-2]
+        basis.append(Lx_new)
+    return basis
+
+
+def band_energy_proxy(
+    h: Tensor,
+    edge_index: Tensor,
+    edge_weight: Optional[Tensor],
+    num_nodes: int,
+    cheby_order: int = 4,
+    eps: float = 1e-12,
+) -> Tensor:
+    """Approximate high-frequency energy fraction via Chebyshev projectors.
+
+    Returns energy_high / (energy_low + energy_high + eps) as a differentiable scalar.
+    Low-frequency = orders 0..1, high-frequency = orders (K-1)..K.
+    """
+    def Lx_fn(v: Tensor) -> Tensor:
+        return _normalized_laplacian_matvec(edge_index, edge_weight, v, num_nodes)
+
+    K = max(2, int(cheby_order))
+    basis = _chebyshev_basis(Lx_fn, h, K)
+
+    # Low-frequency energy: from T_0 and T_1
+    energy_low = sum((b * b).sum() for b in basis[:2])
+    # High-frequency energy: from T_{K-1} and T_K
+    energy_high = sum((b * b).sum() for b in basis[-2:])
+
+    return energy_high / (energy_low + energy_high + eps)
+
+
 class SSISensor:
     """Stable helper for estimating normalized lambda2 and its tail risk.
 
