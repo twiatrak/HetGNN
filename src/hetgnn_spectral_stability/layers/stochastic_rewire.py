@@ -78,6 +78,8 @@ class RewireStats:
     # Best-effort signal that anchors made it into the gated pool.
     # When anchors are explicitly injected into the pool, this will be 1.0.
     anchor_coverage: Optional[Tensor] = None
+    # Per-anchor probabilities (available in soft mode).
+    anchor_probs: Optional[Tensor] = None
 
 
 class EdgeGateMLP(nn.Module):
@@ -254,6 +256,7 @@ class StochasticRewiring(nn.Module):
         candidate_edge_index: Optional[Tensor] = None,
         candidate_edge_weight: Optional[Tensor] = None,
         anchor_edge_index: Optional[Tensor] = None,
+        anchor_mode: str = "soft",
         sample: Optional[bool] = None,
     ) -> Tuple[Tensor, Tensor, RewireStats, Tensor]:
         """Rewire edges and return weighted graph plus statistics.
@@ -327,8 +330,9 @@ class StochasticRewiring(nn.Module):
             )
 
             anchor_coverage: Optional[Tensor] = None
+            anchor_probs: Optional[Tensor] = None
             if anchor_edge_index is not None:
-                # Build an indicator over the canonical pool and force gates=1 for anchors.
+                # Build an indicator over the canonical pool for anchor edges.
                 row, col = pool_edge_index
                 pool_key = row * num_nodes + col
 
@@ -345,8 +349,15 @@ class StochasticRewiring(nn.Module):
                 anchor_mask = torch.zeros_like(pool_key, dtype=torch.bool)
                 anchor_mask[perm[pos[hit]]] = True
 
-                gates = torch.where(anchor_mask, torch.ones_like(gates), gates)
+                # Extract per-anchor probs before any gate forcing.
+                anchor_probs = probs[anchor_mask]
                 anchor_coverage = hit.to(h.dtype).mean() if a_key.numel() > 0 else torch.ones((), device=h.device, dtype=h.dtype)
+
+                if anchor_mode == "forced":
+                    # Mode A: hard-force anchor gates to 1.
+                    gates = torch.where(anchor_mask, torch.ones_like(gates), gates)
+                # In "soft" mode, anchors are gated normally — the soft penalty
+                # is handled downstream by the model/training loop.
 
             w_pool = pool_edge_weight * gates
 
@@ -377,6 +388,7 @@ class StochasticRewiring(nn.Module):
                 expected_keep_rate=probs.mean(),
                 expected_num_edges=probs.sum(),
                 anchor_coverage=anchor_coverage,
+                anchor_probs=anchor_probs,
             )
 
             return edge_index_out, w_out, stats, probs_out
