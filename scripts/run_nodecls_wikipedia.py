@@ -44,6 +44,88 @@ def build_knn_candidates(x: torch.Tensor, k: int) -> torch.Tensor:
     return torch.stack([row, col], dim=0)
 
 
+@torch.no_grad()
+def build_two_hop_candidates(edge_index: torch.Tensor, num_nodes: int, max_per_node: int = 10) -> torch.Tensor:
+    """Build candidate edges from 2-hop neighbours that are not direct neighbours."""
+    from torch_geometric.utils import coalesce
+
+    row, col = edge_index
+    # Adjacency set per node (sparse).
+    adj = torch.zeros(num_nodes, num_nodes, device=edge_index.device, dtype=torch.bool)
+    adj[row, col] = True
+    # 2-hop: A^2 mask — any node reachable in 2 steps.
+    # For small graphs, dense is acceptable.
+    adj_float = adj.float()
+    two_hop = (adj_float @ adj_float) > 0
+    # Remove self-loops and existing 1-hop edges.
+    two_hop.fill_diagonal_(False)
+    two_hop = two_hop & ~adj
+    # Sample up to max_per_node per node.
+    rows, cols = [], []
+    for i in range(num_nodes):
+        cands = two_hop[i].nonzero(as_tuple=False).squeeze(-1)
+        if cands.numel() == 0:
+            continue
+        if cands.numel() > max_per_node:
+            perm = torch.randperm(cands.numel(), device=cands.device)[:max_per_node]
+            cands = cands[perm]
+        rows.append(torch.full((cands.numel(),), i, device=edge_index.device, dtype=torch.long))
+        cols.append(cands)
+    if not rows:
+        return torch.zeros(2, 0, device=edge_index.device, dtype=torch.long)
+    return torch.stack([torch.cat(rows), torch.cat(cols)], dim=0)
+
+
+@torch.no_grad()
+def build_candidates(
+    data_x: torch.Tensor,
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    strategy: str = "raw_knn",
+    k: int = 10,
+    model=None,
+) -> torch.Tensor:
+    """Strategy-based candidate generation.
+
+    Strategies:
+        raw_knn   — cosine kNN on raw features (baseline).
+        hidden_knn — cosine kNN on conv1 embeddings (requires model).
+        two_hop   — 2-hop non-neighbours with many paths.
+        hybrid    — union of raw_knn and hidden_knn.
+    """
+    if strategy == "raw_knn":
+        return build_knn_candidates(data_x, k=k)
+    elif strategy == "hidden_knn":
+        if model is None:
+            return build_knn_candidates(data_x, k=k)
+        with torch.no_grad():
+            x1 = model.lin_in(data_x)
+            x1 = F.relu(x1)
+            h1 = model.conv1(x1, edge_index)
+            h1 = F.relu(h1)
+        return build_knn_candidates(h1, k=k)
+    elif strategy == "two_hop":
+        return build_two_hop_candidates(edge_index, num_nodes, max_per_node=k)
+    elif strategy == "hybrid":
+        raw = build_knn_candidates(data_x, k=k)
+        if model is not None:
+            with torch.no_grad():
+                x1 = model.lin_in(data_x)
+                x1 = F.relu(x1)
+                h1 = model.conv1(x1, edge_index)
+                h1 = F.relu(h1)
+            hidden = build_knn_candidates(h1, k=k)
+        else:
+            hidden = raw
+        from torch_geometric.utils import coalesce
+        merged = torch.cat([raw, hidden], dim=1)
+        ones = torch.ones(merged.size(1), device=merged.device, dtype=torch.float32)
+        merged, _ = coalesce(merged, ones, num_nodes=num_nodes, reduce="sum")
+        return merged
+    else:
+        raise ValueError(f"Unknown candidate strategy: {strategy!r}")
+
+
 def cvar(values: torch.Tensor, frac: float) -> torch.Tensor:
     """Compute CVaR (mean of worst frac) for a 1D tensor."""
     if values.numel() == 0:
@@ -224,6 +306,55 @@ def targeted_spectral_attack(
     return attack_idx, edge_index_attacked
 
 
+@torch.no_grad()
+def noise_edge_injection_attack(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    inject_frac: float = 0.1,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Add random non-edges to the graph to simulate noise injection.
+
+    Returns the augmented edge_index with injected noise edges.
+    """
+    from torch_geometric.utils import coalesce, to_undirected
+
+    torch.manual_seed(seed)
+    num_existing = edge_index.size(1)
+    num_inject = max(1, int(round(inject_frac * num_existing)))
+
+    # Build a set of existing edges for fast lookup.
+    row, col = edge_index
+    existing = set()
+    for i in range(row.numel()):
+        u, v = int(row[i]), int(col[i])
+        existing.add((min(u, v), max(u, v)))
+
+    new_rows, new_cols = [], []
+    attempts = 0
+    while len(new_rows) < num_inject and attempts < num_inject * 20:
+        u = torch.randint(0, num_nodes, (1,)).item()
+        v = torch.randint(0, num_nodes, (1,)).item()
+        if u == v:
+            attempts += 1
+            continue
+        key = (min(u, v), max(u, v))
+        if key not in existing:
+            existing.add(key)
+            new_rows.extend([u, v])
+            new_cols.extend([v, u])
+        attempts += 1
+
+    if not new_rows:
+        return edge_index
+
+    noise_edges = torch.tensor([new_rows, new_cols], device=edge_index.device, dtype=torch.long)
+    merged = torch.cat([edge_index, noise_edges], dim=1)
+    ones = torch.ones(merged.size(1), device=edge_index.device, dtype=torch.float32)
+    merged, _ = coalesce(merged, ones, num_nodes=num_nodes, reduce="sum")
+    return merged
+
+
 def self_healing_step(
     model: SimpleNodeClassifier,
     sensor: SSISensor,
@@ -247,13 +378,15 @@ def self_healing_step(
     kl_beta: float = 1.0,
     kl_temp: float = 1.0,
     kl_conf: float = 0.0,
+    anchor_mode: str = "soft",
     device: torch.device = torch.device("cpu"),
-) -> tuple[float, float]:
+) -> tuple[float, float, list[dict]]:
     """Test-time adaptation loop: adjust topology gates to restore lambda2.
     
     Returns:
         lam2_pre_healing: λ₂ CVaR before adaptation
         lam2_post_healing: λ₂ CVaR after adaptation
+        trajectory: per-iteration stats for logging
     """
     model.eval()
 
@@ -300,6 +433,7 @@ def self_healing_step(
             edge_index_attacked,
             candidate_edge_index=candidate_edge_index,
             anchor_edge_index=anchor_shocked,
+            anchor_mode=anchor_mode,
             sample=False,
         )
         logits0 = model.conv2(h1_detached, rw_ei0, edge_weight=rw_ew0)
@@ -317,6 +451,7 @@ def self_healing_step(
             edge_index_attacked,
             candidate_edge_index=candidate_edge_index,
             anchor_edge_index=anchor_shocked,
+            anchor_mode=anchor_mode,
             sample=True,
         )
         return rw_ei, rw_ew
@@ -327,8 +462,10 @@ def self_healing_step(
         cvar_frac=float(cvar_frac),
     )
 
+    trajectory: list[dict] = []
+
     # TTA loop: primal update + dual ascent on spectral constraint + KL consistency
-    for _ in range(num_iters):
+    for it in range(num_iters):
         opt.zero_grad(set_to_none=True)
 
         rw_ei_det, rw_ew_det, rw_stats_det, _ = model.rewire(
@@ -336,6 +473,7 @@ def self_healing_step(
             edge_index_attacked,
             candidate_edge_index=candidate_edge_index,
             anchor_edge_index=anchor_shocked,
+            anchor_mode=anchor_mode,
             sample=False,
         )
         expected_e = rw_stats_det.expected_num_edges
@@ -351,6 +489,7 @@ def self_healing_step(
                 edge_index_attacked,
                 candidate_edge_index=candidate_edge_index,
                 anchor_edge_index=anchor_shocked,
+                anchor_mode=anchor_mode,
                 sample=True,
             )
             lam2_vals.append(sensor.estimate_corrected(rw_ei, rw_ew))
@@ -396,6 +535,17 @@ def self_healing_step(
                 (model.dual_spectral + dual_lr * spectral_violation).clamp_min(0.0)
             )
 
+        # Log per-iteration trajectory.
+        trajectory.append({
+            "iter": it,
+            "lam2_cvar": float(lam2_cvar.detach().cpu()),
+            "expected_e_ratio": float(ratio.detach().cpu()),
+            "vio_lo": float(vio_lo.detach().cpu()),
+            "vio_hi": float(vio_hi.detach().cpu()),
+            "dual_spectral": float(model.dual_spectral.detach().cpu()),
+            "kl_drift": float(kl.detach().cpu()),
+        })
+
     # Compute post-healing lambda2 CVaR
     lam2_post_healing = sensor.estimate_cvar(
         sample_rewire,
@@ -407,7 +557,7 @@ def self_healing_step(
     for name, p in model.named_parameters():
         p.requires_grad_(prior_requires.get(name, True))
 
-    return float(lam2_pre_healing.detach().cpu()), float(lam2_post_healing.detach().cpu())
+    return float(lam2_pre_healing.detach().cpu()), float(lam2_post_healing.detach().cpu()), trajectory
 
 
 def main() -> None:
@@ -451,6 +601,19 @@ def main() -> None:
     parser.add_argument("--rewire-hard", action="store_true")
 
     parser.add_argument("--add-knn", type=int, default=0, help="If >0, add candidate edges via kNN in feature space.")
+    parser.add_argument(
+        "--candidate-strategy",
+        type=str,
+        default="raw_knn",
+        choices=["raw_knn", "hidden_knn", "two_hop", "hybrid"],
+        help="Strategy for candidate edge generation.",
+    )
+    parser.add_argument(
+        "--refresh-candidates-every",
+        type=int,
+        default=0,
+        help="If >0, refresh candidate edges every N epochs after warmup (0=never).",
+    )
 
     parser.add_argument(
         "--validate-lambda2-every",
@@ -528,6 +691,20 @@ def main() -> None:
     parser.add_argument("--cvar-samples", type=int, default=cfg(reg_defaults, "cvar_samples", 4), help="CVaR samples for lambda2 risk.")
     parser.add_argument("--cvar-frac", type=float, default=cfg(reg_defaults, "cvar_frac", 0.5), help="Tail fraction for CVaR (0..1].")
     parser.add_argument("--anchor-knn", type=int, default=0, help="If >0, anchor edges via kNN in feature space.")
+    parser.add_argument(
+        "--anchor-mode",
+        type=str,
+        default=cfg(reg_defaults, "anchor_mode", "soft"),
+        choices=["forced", "soft"],
+        help="Anchor handling: 'forced' (gates=1) or 'soft' (learnable penalty).",
+    )
+    parser.add_argument("--alpha-anchor", type=float, default=cfg(reg_defaults, "alpha_anchor_stability", 0.0), help="Anchor stability/soft penalty weight.")
+    # Band-energy (heterophily-aware frequency preservation).
+    parser.add_argument("--alpha-band-high", type=float, default=cfg(reg_defaults, "alpha_band_high", 0.0), help="Band-energy high-frequency preservation weight.")
+    parser.add_argument("--band-target-high-ratio", type=float, default=cfg(reg_defaults, "band_target_high_ratio", 0.25), help="Target high-frequency energy fraction.")
+    parser.add_argument("--band-cheby-order", type=int, default=cfg(reg_defaults, "band_cheby_order", 4), help="Chebyshev order for band-energy proxy.")
+    parser.add_argument("--alpha-variance-floor", type=float, default=cfg(reg_defaults, "alpha_variance_floor", 0.0), help="Variance floor regularizer weight.")
+    parser.add_argument("--variance-floor", type=float, default=cfg(reg_defaults, "variance_floor", 1e-2), help="Minimum representation variance.")
     parser.add_argument("--zero-shot-shock", action="store_true", help="Run anchor shock evaluation after training.")
     parser.add_argument("--shock-drop-pct", type=float, default=0.1, help="Fraction of anchors to delete.")
     parser.add_argument("--shock-samples", type=int, default=10, help="MC samples for CVaR accuracy.")
@@ -545,6 +722,28 @@ def main() -> None:
     # Targeted spectral attack & self-healing evaluation
     parser.add_argument("--targeted-spectral-attack", action="store_true", help="Use targeted spectral attack (not random).")
     parser.add_argument("--attack-pct", type=float, default=0.15, help="Fraction of anchor edges to attack.")
+    parser.add_argument(
+        "--shock-sweep",
+        action="store_true",
+        help="Run shock-response curve over multiple attack levels.",
+    )
+    parser.add_argument(
+        "--shock-sweep-grid",
+        type=str,
+        default="0.00,0.05,0.10,0.15,0.20,0.30",
+        help="Comma-separated attack fractions for sweep.",
+    )
+    parser.add_argument(
+        "--noise-injection",
+        action="store_true",
+        help="Also evaluate noise edge injection attack.",
+    )
+    parser.add_argument(
+        "--noise-inject-frac",
+        type=float,
+        default=0.1,
+        help="Fraction of edges to inject as noise.",
+    )
     parser.add_argument("--tta-healing-steps", type=int, default=cfg(tta_defaults, "healing_steps", 20), help="TTA iterations for self-healing.")
     parser.add_argument("--tta-dual-lr", type=float, default=cfg(tta_defaults, "dual_lr", 0.01), help="Dual learning rate for TTA.")
     parser.add_argument("--tta-primal-lr", type=float, default=cfg(tta_defaults, "primal_lr", 1e-2), help="Primal learning rate for TTA gate MLP.")
@@ -567,7 +766,7 @@ def main() -> None:
         default=cfg(tta_defaults, "budget_ref_base", False),
         help="Use original (pre-shock) edge count as budget reference during TTA.",
     )
-    parser.add_argument("--comparative-eval", action="store_true", help="Run 3-way comparative eval (baseline vs frozen vs healing).")
+    parser.add_argument("--comparative-eval", action="store_true", help="Run 4-way comparative eval (original vs static vs frozen vs healed).")
 
     args = parser.parse_args()
 
@@ -606,6 +805,13 @@ def main() -> None:
         alpha_edge_budget=float(args.alpha_edge_budget),
         edge_budget_min_ratio=float(args.edge_budget_min_ratio),
         edge_budget_max_ratio=float(args.edge_budget_max_ratio),
+        anchor_mode=str(args.anchor_mode),
+        alpha_anchor_stability=float(args.alpha_anchor),
+        alpha_band_high=float(args.alpha_band_high),
+        band_target_high_ratio=float(args.band_target_high_ratio),
+        band_cheby_order=int(args.band_cheby_order),
+        alpha_variance_floor=float(args.alpha_variance_floor),
+        variance_floor=float(args.variance_floor),
         dual_lr=float(args.dual_lr),
         cvar_samples=int(args.cvar_samples),
         cvar_frac=float(args.cvar_frac),
@@ -648,22 +854,41 @@ def main() -> None:
 
     candidate_edge_index = None
     if int(args.add_knn) > 0:
-        candidate_edge_index = build_knn_candidates(data.x, k=int(args.add_knn))
+        candidate_edge_index = build_candidates(
+            data.x, data.edge_index, num_nodes=data.num_nodes,
+            strategy=args.candidate_strategy, k=int(args.add_knn),
+        )
 
     anchor_edge_index = None
     anchor_edge_index_undirected = None
     if int(args.anchor_knn) > 0:
         anchor_edge_index = build_knn_candidates(data.x, k=int(args.anchor_knn))
 
+    # Keep original topology for pure baseline.
+    edge_index_original = data.edge_index.clone()
+
     # Build augmented topology (original + anchors) for message passing.
+    # In "forced" anchor mode, merge anchors into edge_index_base.
+    # In "soft" anchor mode, keep edge_index_base = original and let anchors
+    # enter only via the candidate pool.
     edge_index_base = data.edge_index
     if anchor_edge_index is not None:
         from torch_geometric.utils import coalesce, to_undirected
 
         anchor_edge_index_undirected = to_undirected(anchor_edge_index, num_nodes=data.num_nodes)
-        merged = torch.cat([edge_index_base, anchor_edge_index_undirected], dim=1)
-        ones = torch.ones(merged.size(1), device=device, dtype=torch.float32)
-        edge_index_base, _ = coalesce(merged, ones, num_nodes=data.num_nodes, reduce="sum")
+
+        if args.anchor_mode == "forced":
+            merged = torch.cat([edge_index_base, anchor_edge_index_undirected], dim=1)
+            ones = torch.ones(merged.size(1), device=device, dtype=torch.float32)
+            edge_index_base, _ = coalesce(merged, ones, num_nodes=data.num_nodes, reduce="sum")
+        else:
+            # Soft mode: append anchors to candidate pool instead.
+            if candidate_edge_index is not None:
+                candidate_edge_index = torch.cat([candidate_edge_index, anchor_edge_index_undirected], dim=1)
+                ones_c = torch.ones(candidate_edge_index.size(1), device=device, dtype=torch.float32)
+                candidate_edge_index, _ = coalesce(candidate_edge_index, ones_c, num_nodes=data.num_nodes, reduce="sum")
+            else:
+                candidate_edge_index = anchor_edge_index_undirected
 
         # Canonical undirected anchors for gating/masking (u<=v).
         anchor_edge_index = canonical_undirected(anchor_edge_index_undirected)
@@ -714,6 +939,9 @@ def main() -> None:
                     "dual_budget_lo",
                     "dual_budget_hi",
                     "dual_spectral_pressure",
+                    "band_high_ratio",
+                    "variance",
+                    "band_loss",
                 ]
             )
 
@@ -749,6 +977,25 @@ def main() -> None:
             )
             cached_lam2_est = float(sensor.estimate(cached_rw[0], cached_rw[1]).detach().cpu())
             cached_epoch = epoch
+
+        # Refresh candidate edges periodically (supports hidden_knn and hybrid strategies).
+        if (
+            enable_rewire
+            and int(args.refresh_candidates_every) > 0
+            and int(args.add_knn) > 0
+            and epoch % int(args.refresh_candidates_every) == 0
+        ):
+            candidate_edge_index = build_candidates(
+                data.x, edge_index_base, num_nodes=data.num_nodes,
+                strategy=args.candidate_strategy, k=int(args.add_knn),
+                model=model if args.candidate_strategy in ("hidden_knn", "hybrid") else None,
+            )
+            # In soft anchor mode, re-merge anchors into candidate pool.
+            if anchor_edge_index is not None and args.anchor_mode == "soft":
+                from torch_geometric.utils import coalesce as _coalesce
+                candidate_edge_index = torch.cat([candidate_edge_index, anchor_edge_index_undirected], dim=1)
+                ones_c = torch.ones(candidate_edge_index.size(1), device=device, dtype=torch.float32)
+                candidate_edge_index, _ = _coalesce(candidate_edge_index, ones_c, num_nodes=data.num_nodes, reduce="sum")
 
         # Temperature control
         if enable_rewire:
@@ -808,6 +1055,16 @@ def main() -> None:
 
         if reg.alpha_dirichlet != 0.0:
             loss = loss + reg.alpha_dirichlet * regs["dirichlet"]
+
+        # Anchor stability / soft anchor penalty.
+        if reg.alpha_anchor_stability != 0.0 and "anchor_stability" in regs:
+            loss = loss + reg.alpha_anchor_stability * regs["anchor_stability"]
+
+        # Band-energy and variance floor losses.
+        if reg.alpha_band_high != 0.0 and "band_loss" in regs:
+            loss = loss + reg.alpha_band_high * regs["band_loss"]
+        if reg.alpha_variance_floor != 0.0 and "variance_floor_loss" in regs:
+            loss = loss + reg.alpha_variance_floor * regs["variance_floor_loss"]
 
         # Primal-dual constrained losses.
         if enable_rewire:
@@ -891,6 +1148,9 @@ def main() -> None:
                         float(regs_eval.get("dual_budget_lo", torch.tensor(float("nan"))).detach().cpu()),
                         float(regs_eval.get("dual_budget_hi", torch.tensor(float("nan"))).detach().cpu()),
                         float(regs_eval.get("dual_spectral", torch.tensor(float("nan"))).detach().cpu()),
+                        float(regs_eval.get("band_high_ratio", torch.tensor(float("nan"))).detach().cpu()),
+                        float(regs_eval.get("variance", torch.tensor(float("nan"))).detach().cpu()),
+                        float(regs_eval.get("band_loss", torch.tensor(float("nan"))).detach().cpu()),
                     ]
                 )
 
@@ -1015,98 +1275,6 @@ def main() -> None:
                 1.0
             )
 
-        def adapt_topology(steps: int, primal_steps: int, primal_lr: float) -> None:
-            gate_params = list(model.rewire.gate_mlp.parameters())
-            opt_primal = torch.optim.SGD(gate_params, lr=float(primal_lr)) if primal_steps > 0 else None
-            for _ in range(max(1, int(steps))):
-                with torch.no_grad():
-                    x1 = model.lin_in(data.x)
-                    x1 = F.relu(x1)
-                    x1 = F.dropout(x1, p=model.dropout, training=False)
-                    h1 = model.conv1(x1, edge_index_shocked)
-                    h1 = F.relu(h1)
-                    h1 = F.dropout(h1, p=model.dropout, training=False)
-                    h1_detached = h1.detach()
-
-                # Primal update: adjust gate MLP to reduce violations on shocked graph.
-                if opt_primal is not None and int(primal_steps) > 0:
-                    for _ in range(int(primal_steps)):
-                        opt_primal.zero_grad(set_to_none=True)
-                        rw_edge_index_e, rw_edge_weight_e, rw_stats_e, _ = model.rewire(
-                            h1_detached,
-                            edge_index_shocked,
-                            candidate_edge_index=candidate_edge_index,
-                            anchor_edge_index=anchor_shocked,
-                            sample=False,
-                        )
-                        expected_e = rw_stats_e.expected_num_edges
-                        ratio = (expected_e / e_ref_for(edge_index_shocked)).clamp_min(0.0)
-                        vio_lo = (float(args.edge_budget_min_ratio) - ratio).clamp_min(0.0)
-                        vio_hi = (ratio - float(args.edge_budget_max_ratio)).clamp_min(0.0)
-
-                        def sample_primal() -> tuple[torch.Tensor, torch.Tensor | None]:
-                            rw_edge_index_s, rw_edge_weight_s, _, _ = model.rewire(
-                                h1_detached,
-                                edge_index_shocked,
-                                candidate_edge_index=candidate_edge_index,
-                                anchor_edge_index=anchor_shocked,
-                                sample=True,
-                            )
-                            return rw_edge_index_s, rw_edge_weight_s
-
-                        lam2_risk_e = sensor.estimate_cvar(
-                            sample_primal,
-                            samples=int(args.shock_primal_samples),
-                            cvar_frac=float(args.cvar_frac),
-                        )
-                        spectral_violation_e = (float(args.conn_eps) - lam2_risk_e).clamp_min(0.0)
-
-                        loss_primal = (
-                            model.dual_budget_lo * vio_lo
-                            + 0.5 * vio_lo.pow(2)
-                            + model.dual_budget_hi * vio_hi
-                            + 0.5 * vio_hi.pow(2)
-                            + model.dual_spectral * spectral_violation_e
-                            + 0.5 * spectral_violation_e.pow(2)
-                        )
-                        loss_primal.backward()
-                        opt_primal.step()
-
-                # Dual update: use CVaR risk under stochastic rewiring.
-                rw_edge_index_e, rw_edge_weight_e, rw_stats_e, _ = model.rewire(
-                    h1_detached,
-                    edge_index_shocked,
-                    candidate_edge_index=candidate_edge_index,
-                    anchor_edge_index=anchor_shocked,
-                    sample=False,
-                )
-                expected_e = rw_stats_e.expected_num_edges
-                ratio = (expected_e / e_ref_for(edge_index_shocked)).clamp_min(0.0)
-                vio_lo = (float(args.edge_budget_min_ratio) - ratio).clamp_min(0.0)
-                vio_hi = (ratio - float(args.edge_budget_max_ratio)).clamp_min(0.0)
-
-                def sample_dual() -> tuple[torch.Tensor, torch.Tensor | None]:
-                    rw_edge_index_s, rw_edge_weight_s, _, _ = model.rewire(
-                        h1_detached,
-                        edge_index_shocked,
-                        candidate_edge_index=candidate_edge_index,
-                        anchor_edge_index=anchor_shocked,
-                        sample=True,
-                    )
-                    return rw_edge_index_s, rw_edge_weight_s
-
-                lam2_cvar = sensor.estimate_cvar(
-                    sample_dual,
-                    samples=int(args.cvar_samples),
-                    cvar_frac=float(args.cvar_frac),
-                )
-                spectral_violation = (float(args.conn_eps) - lam2_cvar).clamp_min(0.0)
-
-                with torch.no_grad():
-                    model.dual_budget_lo.copy_((model.dual_budget_lo + model.dual_lr * vio_lo).clamp_min(0.0))
-                    model.dual_budget_hi.copy_((model.dual_budget_hi + model.dual_lr * vio_hi).clamp_min(0.0))
-                    model.dual_spectral.copy_((model.dual_spectral + model.dual_lr * spectral_violation).clamp_min(0.0))
-
         def eval_cvar_accuracy(
             model_eval: SimpleNodeClassifier, enable_rewire: bool, edge_index_eval: torch.Tensor
         ) -> tuple[float, float, float, float]:
@@ -1201,7 +1369,32 @@ def main() -> None:
                     model.dual_budget_lo.zero_()
                     model.dual_budget_hi.zero_()
                     model.dual_spectral.zero_()
-            adapt_topology(int(args.shock_adapt_steps), int(args.shock_primal_steps), float(args.shock_primal_lr))
+            _lam2_pre_adapt, _lam2_post_adapt, _adapt_traj = self_healing_step(
+                model,
+                sensor,
+                data.x,
+                edge_index_shocked,
+                candidate_edge_index=candidate_edge_index,
+                anchor_shocked=anchor_shocked,
+                num_nodes=data.num_nodes,
+                target_lambda2=float(args.conn_eps),
+                budget_min_ratio=float(args.edge_budget_min_ratio),
+                budget_max_ratio=float(args.edge_budget_max_ratio),
+                budget_beta=float(tta.budget_beta),
+                budget_hard=bool(tta.budget_hard),
+                budget_dual_scale=float(tta.budget_dual_scale),
+                budget_ref_edges=float(edge_index_base.size(1)) if tta.budget_ref_base else None,
+                primal_lr=float(tta.primal_lr),
+                dual_lr=float(tta.dual_lr),
+                num_iters=int(args.shock_adapt_steps),
+                cvar_frac=float(tta.cvar_frac),
+                cvar_samples=int(tta.cvar_samples),
+                kl_beta=float(tta.kl_beta),
+                kl_temp=float(tta.kl_temp),
+                kl_conf=float(tta.kl_conf),
+                anchor_mode=str(args.anchor_mode),
+                device=device,
+            )
             mean_self_adapt, cvar_self_adapt, min_self_adapt, max_self_adapt = eval_cvar_accuracy(
                 model, enable_rewire=True, edge_index_eval=edge_index_shocked
             )
@@ -1213,6 +1406,33 @@ def main() -> None:
             lam2_self_adapt, ratio_self_adapt, vio_lo_self_adapt, vio_hi_self_adapt = (None, None, None, None)
 
         # Baseline: train a separate backbone on the same augmented graph unless disabled.
+        # Also train a pure original-topology baseline for fair comparison.
+        def _train_baseline(bb: str, ei: torch.Tensor, epochs: int) -> SimpleNodeClassifier:
+            bl_reg = RegularizationConfig()
+            bl_model = SimpleNodeClassifier(
+                in_dim=dataset.num_features,
+                hidden_dim=int(args.hidden),
+                out_dim=dataset.num_classes,
+                backbone=bb,
+                dropout=float(args.dropout),
+                rewire_temperature=float(args.rewire_temp),
+                rewire_hard=bool(args.rewire_hard),
+                rewire_symmetric=True,
+                reg=bl_reg,
+            ).to(device)
+            bl_opt = torch.optim.Adam(
+                bl_model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay)
+            )
+            bl_model.train()
+            for _ in range(1, epochs + 1):
+                bl_opt.zero_grad(set_to_none=True)
+                bl_logits, _ = bl_model(data.x, ei, enable_rewire=False, rewire_sample=None)
+                bl_loss = F.cross_entropy(bl_logits[train_mask], data.y[train_mask])
+                bl_loss.backward()
+                bl_opt.step()
+            bl_model.eval()
+            return bl_model
+
         if args.no_shock_baseline:
             baseline_model = model
             mean_base, cvar_base, min_base, max_base = eval_cvar_accuracy(
@@ -1220,63 +1440,47 @@ def main() -> None:
             )
             lam2_base, ratio_base, vio_lo_base, vio_hi_base = eval_shock_stats(baseline_model, enable_rewire=False)
         else:
-            baseline_reg = RegularizationConfig()
-            baseline_model = SimpleNodeClassifier(
-                in_dim=dataset.num_features,
-                hidden_dim=int(args.hidden),
-                out_dim=dataset.num_classes,
-                backbone=args.shock_baseline_backbone,
-                dropout=float(args.dropout),
-                rewire_temperature=float(args.rewire_temp),
-                rewire_hard=bool(args.rewire_hard),
-                rewire_symmetric=True,
-                reg=baseline_reg,
-            ).to(device)
-            opt_base = torch.optim.Adam(
-                baseline_model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay)
-            )
-            baseline_model.train()
-            for _ in range(1, int(args.epochs) + 1):
-                opt_base.zero_grad(set_to_none=True)
-                logits_b, _ = baseline_model(
-                    data.x, edge_index_base, enable_rewire=False, rewire_sample=None
-                )
-                loss_b = F.cross_entropy(logits_b[train_mask], data.y[train_mask])
-                loss_b.backward()
-                opt_base.step()
-            baseline_model.eval()
+            baseline_model = _train_baseline(args.shock_baseline_backbone, edge_index_base, int(args.epochs))
             mean_base, cvar_base, min_base, max_base = eval_cvar_accuracy(
                 baseline_model, enable_rewire=False, edge_index_eval=edge_index_shocked
             )
             lam2_base, ratio_base, vio_lo_base, vio_hi_base = eval_shock_stats(baseline_model, enable_rewire=False)
 
-        # **COMPARATIVE EVALUATION: 3-WAY COMPARISON (Optional)**
+        # **COMPARATIVE EVALUATION: 4-WAY COMPARISON (Optional)**
         if args.comparative_eval:
-            print("\n=== 3-Way Comparative Evaluation ===")
+            print("\n=== 4-Way Comparative Evaluation ===")
 
-            # 1. GCN Baseline (no rewiring)
-            print("(1/3) GCN Baseline on attacked graph...")
-            mean_baseline, cvar_baseline, min_baseline, max_baseline = eval_cvar_accuracy(
+            # 1. Original GCN/SAGE (no anchors, original topology)
+            print("(1/4) Original GCN on original topology...")
+            original_model = _train_baseline(args.shock_baseline_backbone, edge_index_original, int(args.epochs))
+            mean_orig, cvar_orig, min_orig, max_orig = eval_cvar_accuracy(
+                original_model, enable_rewire=False, edge_index_eval=edge_index_shocked
+            )
+            lam2_orig, ratio_orig, _, _ = eval_shock_stats(original_model, enable_rewire=False)
+
+            # 2. Static augmented graph (anchors merged, no rewiring)
+            print("(2/4) Static augmented graph baseline...")
+            mean_static, cvar_static, min_static, max_static = eval_cvar_accuracy(
                 baseline_model, enable_rewire=False, edge_index_eval=edge_index_shocked
             )
-            lam2_baseline_val, ratio_baseline_val, _, _ = eval_shock_stats(baseline_model, enable_rewire=False)
+            lam2_static, ratio_static, _, _ = eval_shock_stats(baseline_model, enable_rewire=False)
 
-            # 2. Frozen Framework (rewiring without adaptation)
-            print("(2/3) Frozen Self-Healing (no TTA)...")
+            # 3. Frozen Framework (rewiring without adaptation)
+            print("(3/4) Frozen Rewiring (no TTA)...")
             mean_frozen, cvar_frozen, min_frozen, max_frozen = eval_cvar_accuracy(
                 model, enable_rewire=True, edge_index_eval=edge_index_shocked
             )
             lam2_frozen, ratio_frozen, _, _ = eval_shock_stats(model, enable_rewire=True)
 
-            # 3. Self-Healing Framework (with TTA)
-            print("(3/3) Self-Healing with TTA...")
+            # 4. Self-Healing Framework (with TTA)
+            print("(4/4) Self-Healing with TTA...")
             if args.shock_reset_duals:
                 with torch.no_grad():
                     model.dual_budget_lo.zero_()
                     model.dual_budget_hi.zero_()
                     model.dual_spectral.zero_()
 
-            lam2_pre_healing, lam2_post_healing = self_healing_step(
+            lam2_pre_healing, lam2_post_healing, healing_traj = self_healing_step(
                 model,
                 sensor,
                 data.x,
@@ -1299,6 +1503,7 @@ def main() -> None:
                 kl_beta=float(tta.kl_beta),
                 kl_temp=float(tta.kl_temp),
                 kl_conf=float(tta.kl_conf),
+                anchor_mode=str(args.anchor_mode),
                 device=device,
             )
 
@@ -1307,41 +1512,222 @@ def main() -> None:
             )
             lam2_healed, ratio_healed, _, _ = eval_shock_stats(model, enable_rewire=True)
 
-            # Compute SSI Recovery Ratio
+            # Compute SSI 3-axis report.
             ssi_recovery = lam2_post_healing / max(lam2_pre_healing, 1e-6)
 
-            # Print comparative table
-            print("\n" + "=" * 100)
+            print("\n" + "=" * 120)
             print(
-                f"{'Method':<25} {'Accuracy':<15} {'CVaR Acc':<15} "
-                f"{'λ₂ CVaR':<15} {'Edge Ratio':<15} {'SSI Recovery':<15}"
+                f"{'Method':<30} {'Accuracy':<12} {'CVaR Acc':<12} "
+                f"{'λ₂ CVaR':<12} {'Edge Ratio':<12} {'SSI Recovery':<12}"
             )
-            print("=" * 100)
+            print("=" * 120)
             print(
-                f"{'GCN Baseline':<25} {mean_baseline:.4f}        {cvar_baseline:.4f}        "
-                f"{lam2_baseline_val:.4f}        {ratio_baseline_val:.4f}        {'N/A':<15}"
-            )
-            print(
-                f"{'Frozen Self-Healing':<25} {mean_frozen:.4f}        {cvar_frozen:.4f}        "
-                f"{lam2_frozen:.4f}        {ratio_frozen:.4f}        {'N/A':<15}"
+                f"{'Original GCN':<30} {mean_orig:.4f}       {cvar_orig:.4f}       "
+                f"{lam2_orig:.4f}       {ratio_orig:.4f}       {'N/A':<12}"
             )
             print(
-                f"{'Self-Healing (TTA)':<25} {mean_healed:.4f}        {cvar_healed:.4f}        "
-                f"{lam2_healed:.4f}        {ratio_healed:.4f}        {ssi_recovery:.4f}"
+                f"{'Static Augmented':<30} {mean_static:.4f}       {cvar_static:.4f}       "
+                f"{lam2_static:.4f}       {ratio_static:.4f}       {'N/A':<12}"
             )
-            print("=" * 100)
+            print(
+                f"{'Frozen Rewiring':<30} {mean_frozen:.4f}       {cvar_frozen:.4f}       "
+                f"{lam2_frozen:.4f}       {ratio_frozen:.4f}       {'N/A':<12}"
+            )
+            print(
+                f"{'Healed Rewiring (TTA)':<30} {mean_healed:.4f}       {cvar_healed:.4f}       "
+                f"{lam2_healed:.4f}       {ratio_healed:.4f}       {ssi_recovery:.4f}"
+            )
+            print("=" * 120)
 
-            # Robustness gap analysis
-            acc_gap_baseline = mean_baseline - mean_healed
-            acc_gap_frozen = mean_frozen - mean_healed
-            lam2_improvement = lam2_post_healing - lam2_pre_healing
+            # SSI 3-axis summary
+            print("\nSSI 3-Axis Report:")
+            print(f"  [Connectivity] λ₂_CVaR={lam2_healed:.4f}  recovery={ssi_recovery:.4f}x")
+            print(f"  [Frequency]    (band_high_ratio / variance logged in SSI CSV)")
+            print(f"  [Robustness]   mean_acc={mean_healed:.4f}  cvar_acc={cvar_healed:.4f}")
+            print(f"  Healing TTA trajectory: {len(healing_traj)} steps")
+            if healing_traj:
+                print(f"    first: {healing_traj[0]}")
+                print(f"    last:  {healing_traj[-1]}")
 
-            print(f"\nResilience Gap Analysis:")
-            print(f"  Baseline → Healed accuracy gap: {acc_gap_baseline:+.4f}")
-            print(f"  Frozen → Healed accuracy gap: {acc_gap_frozen:+.4f}")
-            print(f"  SSI Recovery Ratio (post/pre): {ssi_recovery:.4f}x")
-            print(f"  SSI Improvement (post - pre): {lam2_improvement:+.6f}")
-            print("=" * 100)
+        # **SHOCK-RESPONSE SWEEP (Optional)**
+        if args.shock_sweep:
+            grid = [float(x) for x in args.shock_sweep_grid.split(",") if x.strip()]
+            sweep_csv_path = None
+            if args.log_csv:
+                csv_base = Path(args.log_csv)
+                sweep_csv_path = csv_base.with_name(f"{csv_base.stem}_sweep{csv_base.suffix}")
+                with sweep_csv_path.open("w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow([
+                        "attack_pct", "attack_type",
+                        "frozen_mean_acc", "frozen_cvar_acc", "frozen_lam2_cvar", "frozen_e_ratio",
+                        "healed_mean_acc", "healed_cvar_acc", "healed_lam2_cvar", "healed_e_ratio",
+                        "ssi_recovery", "healing_gain",
+                    ])
+
+            print("\n=== Shock-Response Sweep ===")
+            for apct in grid:
+                # Reload best model for each sweep point.
+                if best_state is not None:
+                    model.load_state_dict(best_state, strict=True)
+                model.eval()
+
+                if apct <= 0.0:
+                    # No attack.
+                    ei_swept = edge_index_base
+                    anc_swept = anchor_edge_index
+                else:
+                    # Use targeted attack if enabled, else random deletion.
+                    if args.targeted_spectral_attack:
+                        attack_idx, ei_swept = targeted_spectral_attack(
+                            model, sensor, data.x, edge_index_base,
+                            candidate_edge_index=candidate_edge_index,
+                            anchor_edge_index=anchor_edge_index,
+                            attack_pct=apct, device=device,
+                        )
+                        # Derive surviving anchors from attack indices.
+                        keep_mask_a = torch.ones(anchor_edge_index.size(1), device=device, dtype=torch.bool)
+                        keep_mask_a[attack_idx] = False
+                        anc_swept = anchor_edge_index[:, keep_mask_a]
+                    else:
+                        torch.manual_seed(int(args.shock_seed))
+                        num_a = anchor_edge_index.size(1)
+                        keep_n = max(1, int(round((1.0 - apct) * num_a)))
+                        perm_a = torch.randperm(num_a, device=device)[:keep_n]
+                        drop_mask_a = torch.ones(num_a, device=device, dtype=torch.bool)
+                        drop_mask_a[perm_a] = False
+                        dropped_a = anchor_edge_index[:, drop_mask_a]
+                        ei_swept = remove_undirected_pairs(edge_index_base, dropped_a, num_nodes=data.num_nodes)
+                        anc_swept = anchor_edge_index[:, ~drop_mask_a]
+
+                    ones_sw = torch.ones(ei_swept.size(1), device=device, dtype=torch.float32)
+                    ei_swept, _ = coalesce(ei_swept, ones_sw, num_nodes=data.num_nodes, reduce="sum")
+
+                # Override anchor_shocked for eval helpers.
+                anchor_shocked_bak = anchor_shocked
+                edge_index_shocked_bak = edge_index_shocked
+                anchor_shocked = anc_swept if apct > 0.0 else anchor_edge_index
+                edge_index_shocked = ei_swept
+
+                # Frozen eval.
+                f_mean, f_cvar, _, _ = eval_cvar_accuracy(model, enable_rewire=True, edge_index_eval=ei_swept)
+                f_lam2, f_ratio, _, _ = eval_shock_stats(model, enable_rewire=True)
+
+                # Healed eval.
+                if args.shock_reset_duals:
+                    with torch.no_grad():
+                        model.dual_budget_lo.zero_()
+                        model.dual_budget_hi.zero_()
+                        model.dual_spectral.zero_()
+
+                _l2pre, _l2post, _ = self_healing_step(
+                    model, sensor, data.x, ei_swept,
+                    candidate_edge_index=candidate_edge_index,
+                    anchor_shocked=anchor_shocked,
+                    num_nodes=data.num_nodes,
+                    target_lambda2=float(args.conn_eps),
+                    budget_min_ratio=float(args.edge_budget_min_ratio),
+                    budget_max_ratio=float(args.edge_budget_max_ratio),
+                    budget_beta=float(tta.budget_beta),
+                    budget_hard=bool(tta.budget_hard),
+                    budget_dual_scale=float(tta.budget_dual_scale),
+                    budget_ref_edges=float(edge_index_base.size(1)) if tta.budget_ref_base else None,
+                    primal_lr=float(tta.primal_lr),
+                    dual_lr=float(tta.dual_lr),
+                    num_iters=int(tta.healing_steps),
+                    cvar_frac=float(tta.cvar_frac),
+                    cvar_samples=int(tta.cvar_samples),
+                    kl_beta=float(tta.kl_beta),
+                    kl_temp=float(tta.kl_temp),
+                    kl_conf=float(tta.kl_conf),
+                    anchor_mode=str(args.anchor_mode),
+                    device=device,
+                )
+                h_mean, h_cvar, _, _ = eval_cvar_accuracy(model, enable_rewire=True, edge_index_eval=ei_swept)
+                h_lam2, h_ratio, _, _ = eval_shock_stats(model, enable_rewire=True)
+                ssi_r = _l2post / max(_l2pre, 1e-6)
+                h_gain = h_mean - f_mean
+
+                print(f"  attack={apct:.2f} | frozen acc={f_mean:.4f} cvar={f_cvar:.4f} | "
+                      f"healed acc={h_mean:.4f} cvar={h_cvar:.4f} | ssi={ssi_r:.4f} gain={h_gain:+.4f}")
+
+                if sweep_csv_path is not None:
+                    with sweep_csv_path.open("a", newline="") as f:
+                        w = csv.writer(f)
+                        w.writerow([
+                            apct, "deletion",
+                            f_mean, f_cvar, f_lam2, f_ratio,
+                            h_mean, h_cvar, h_lam2, h_ratio,
+                            ssi_r, h_gain,
+                        ])
+
+                # Restore for next iteration.
+                anchor_shocked = anchor_shocked_bak
+                edge_index_shocked = edge_index_shocked_bak
+
+        # **NOISE INJECTION ATTACK (Optional)**
+        if args.noise_injection:
+            if best_state is not None:
+                model.load_state_dict(best_state, strict=True)
+            model.eval()
+
+            print("\n=== Noise Edge Injection Attack ===")
+            ei_noisy = noise_edge_injection_attack(
+                edge_index_base, num_nodes=data.num_nodes,
+                inject_frac=float(args.noise_inject_frac),
+                seed=int(args.shock_seed),
+            )
+            print(f"Injected noise: {ei_noisy.size(1) - edge_index_base.size(1)} edges "
+                  f"({float(args.noise_inject_frac):.0%} of original)")
+
+            # Override for eval helpers.
+            anchor_shocked_noise = anchor_edge_index if anchor_edge_index is not None else torch.zeros(2, 0, device=device, dtype=torch.long)
+            anchor_shocked_bak2 = anchor_shocked
+            edge_index_shocked_bak2 = edge_index_shocked
+            anchor_shocked = anchor_shocked_noise
+            edge_index_shocked = ei_noisy
+
+            n_mean_f, n_cvar_f, _, _ = eval_cvar_accuracy(model, enable_rewire=True, edge_index_eval=ei_noisy)
+            n_lam2_f, n_ratio_f, _, _ = eval_shock_stats(model, enable_rewire=True)
+
+            if args.shock_reset_duals:
+                with torch.no_grad():
+                    model.dual_budget_lo.zero_()
+                    model.dual_budget_hi.zero_()
+                    model.dual_spectral.zero_()
+
+            _n_l2pre, _n_l2post, _ = self_healing_step(
+                model, sensor, data.x, ei_noisy,
+                candidate_edge_index=candidate_edge_index,
+                anchor_shocked=anchor_shocked_noise,
+                num_nodes=data.num_nodes,
+                target_lambda2=float(args.conn_eps),
+                budget_min_ratio=float(args.edge_budget_min_ratio),
+                budget_max_ratio=float(args.edge_budget_max_ratio),
+                budget_beta=float(tta.budget_beta),
+                budget_hard=bool(tta.budget_hard),
+                budget_dual_scale=float(tta.budget_dual_scale),
+                budget_ref_edges=float(edge_index_base.size(1)) if tta.budget_ref_base else None,
+                primal_lr=float(tta.primal_lr),
+                dual_lr=float(tta.dual_lr),
+                num_iters=int(tta.healing_steps),
+                cvar_frac=float(tta.cvar_frac),
+                cvar_samples=int(tta.cvar_samples),
+                kl_beta=float(tta.kl_beta),
+                kl_temp=float(tta.kl_temp),
+                kl_conf=float(tta.kl_conf),
+                anchor_mode=str(args.anchor_mode),
+                device=device,
+            )
+            n_mean_h, n_cvar_h, _, _ = eval_cvar_accuracy(model, enable_rewire=True, edge_index_eval=ei_noisy)
+            n_lam2_h, n_ratio_h, _, _ = eval_shock_stats(model, enable_rewire=True)
+            n_ssi_r = _n_l2post / max(_n_l2pre, 1e-6)
+
+            print(f"  Noise injection: frozen acc={n_mean_f:.4f} cvar={n_cvar_f:.4f} | "
+                  f"healed acc={n_mean_h:.4f} cvar={n_cvar_h:.4f} | ssi={n_ssi_r:.4f}")
+
+            anchor_shocked = anchor_shocked_bak2
+            edge_index_shocked = edge_index_shocked_bak2
 
         msg = (
             "Zero-shot anchor shock (drop "
