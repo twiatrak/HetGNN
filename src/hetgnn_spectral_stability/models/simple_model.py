@@ -124,6 +124,7 @@ class SimpleNodeClassifier(nn.Module):
                 edge_index,
                 candidate_edge_index=candidate_edge_index,
                 anchor_edge_index=anchor_edge_index,
+                anchor_mode=self.reg.anchor_mode,
                 sample=rewire_sample,
             )
         else:
@@ -196,6 +197,7 @@ class SimpleNodeClassifier(nn.Module):
                         edge_index,
                         candidate_edge_index=candidate_edge_index,
                         anchor_edge_index=anchor_edge_index,
+                        anchor_mode=self.reg.anchor_mode,
                         sample=True,
                     )
                     lam2_s = estimate_lambda2_norm_min_rayleigh(
@@ -240,12 +242,41 @@ class SimpleNodeClassifier(nn.Module):
             if spectral_violation is not None:
                 regs["spectral_dual"] = regs["dual_spectral"] * spectral_violation + 0.5 * spectral_violation.pow(2)
 
-        # Anchor stability penalty (0 when all anchors are guaranteed included).
+        # Anchor stability penalty — depends on anchor_mode.
         if enable_rewire and rw_stats is not None and float(self.reg.alpha_anchor_stability) != 0.0:
-            if rw_stats.anchor_coverage is not None:
-                cov = rw_stats.anchor_coverage.to(device=logits.device, dtype=logits.dtype)
-                regs["anchor_coverage"] = cov
-                regs["anchor_stability"] = (1.0 - cov).clamp_min(0.0).pow(2)
+            if self.reg.anchor_mode == "forced":
+                # Mode A: coverage check (anchors are hard-forced, metric is informational).
+                if rw_stats.anchor_coverage is not None:
+                    cov = rw_stats.anchor_coverage.to(device=logits.device, dtype=logits.dtype)
+                    regs["anchor_coverage"] = cov
+                    regs["anchor_stability"] = (1.0 - cov).clamp_min(0.0).pow(2)
+            else:
+                # Mode B: soft anchors — penalise low anchor probabilities.
+                if rw_stats.anchor_probs is not None and rw_stats.anchor_probs.numel() > 0:
+                    p_anchor = rw_stats.anchor_probs.to(device=logits.device, dtype=logits.dtype)
+                    regs["anchor_soft_loss"] = ((1.0 - p_anchor) ** 2).mean()
+                    regs["anchor_stability"] = regs["anchor_soft_loss"]
+                    if rw_stats.anchor_coverage is not None:
+                        regs["anchor_coverage"] = rw_stats.anchor_coverage.to(device=logits.device, dtype=logits.dtype)
+
+        # Band-energy regularizer (heterophily-aware frequency preservation).
+        # Always compute band metrics for logging; only add loss when weights > 0.
+        if enable_rewire and rw_edge_index is not None:
+            from hetgnn_spectral_stability.regularizers.spectral import band_energy_proxy
+
+            be = band_energy_proxy(
+                h1, rw_edge_index, rw_edge_weight, num_nodes=h1.size(0),
+                cheby_order=int(self.reg.band_cheby_order),
+            )
+            regs["band_high_ratio"] = be
+
+            var = h1.var(dim=0).mean()
+            regs["variance"] = var
+
+            if float(self.reg.alpha_band_high) != 0.0:
+                regs["band_loss"] = F.relu(float(self.reg.band_target_high_ratio) - be).pow(2)
+            if float(self.reg.alpha_variance_floor) != 0.0:
+                regs["variance_floor_loss"] = F.relu(float(self.reg.variance_floor) - var).pow(2)
 
         # For logging
         if rw_stats is None:
