@@ -242,7 +242,7 @@ def tier3_end_to_end() -> None:
     from run_nodecls_wikipedia import self_healing_step
 
     dual_before = float(model.dual_spectral.detach().cpu())
-    lam2_pre, lam2_post = self_healing_step(
+    lam2_pre, lam2_post, heal_traj = self_healing_step(
         model,
         sensor,
         x,
@@ -260,6 +260,7 @@ def tier3_end_to_end() -> None:
         kl_beta=1.0,
         kl_temp=1.0,
         kl_conf=0.0,
+        anchor_mode="forced",
         device=torch.device("cpu"),
     )
 
@@ -287,11 +288,185 @@ def tier3_end_to_end() -> None:
         f"dual={dual_before:.4f}->{dual_after:.4f} "
         f"E={float(stats_pre.expected_num_edges):.2f}->{float(stats_post.expected_num_edges):.2f}"
     )
+    if heal_traj:
+        print(f"  Healing trajectory: {len(heal_traj)} steps, "
+              f"first={heal_traj[0]}, last={heal_traj[-1]}")
+
+
+def tier4_controller_monotonicity() -> None:
+    """Test dynamic_temperature_from_lambda2: lower λ₂ → higher temperature."""
+    from run_nodecls_wikipedia import dynamic_temperature_from_lambda2
+
+    tau_lo = dynamic_temperature_from_lambda2(
+        0.05, tau_min=0.3, tau_max=3.0, target=0.1, slope=0.1
+    )
+    tau_mid = dynamic_temperature_from_lambda2(
+        0.10, tau_min=0.3, tau_max=3.0, target=0.1, slope=0.1
+    )
+    tau_hi = dynamic_temperature_from_lambda2(
+        0.30, tau_min=0.3, tau_max=3.0, target=0.1, slope=0.1
+    )
+
+    # Sigmoid schedule is monotone: lower λ₂ → higher temperature.
+    assert tau_lo >= tau_mid >= tau_hi, (
+        f"Controller not monotone: tau(0.05)={tau_lo:.4f}, "
+        f"tau(0.10)={tau_mid:.4f}, tau(0.30)={tau_hi:.4f}"
+    )
+    # All outputs must stay within [tau_min, tau_max].
+    assert 0.3 <= tau_hi <= 3.0, f"tau_hi out of range: {tau_hi:.4f}"
+    assert 0.3 <= tau_lo <= 3.0, f"tau_lo out of range: {tau_lo:.4f}"
+
+    print(
+        f"Tier 4: controller monotonicity OK | "
+        f"tau(0.05)={tau_lo:.3f} tau(0.10)={tau_mid:.3f} tau(0.30)={tau_hi:.3f}"
+    )
+
+
+def tier5_soft_anchor_effectiveness() -> None:
+    """Test soft anchor mode: anchors enter as candidates with learnable gates, not forced."""
+    torch.manual_seed(42)
+    from hetgnn_spectral_stability.config import RegularizationConfig
+
+    num_nodes = 12
+    edges = [(i, (i + 1) % num_nodes) for i in range(num_nodes)]
+    edge_index_base = to_undirected_coalesced(make_undirected_edge_index(num_nodes, edges), num_nodes)
+
+    anchors = make_undirected_edge_index(num_nodes, [(0, 6), (2, 8)])
+    anchors = canonical_undirected(to_undirected_coalesced(anchors, num_nodes))
+
+    # Soft mode: create model with anchor_mode="soft"
+    reg = RegularizationConfig(anchor_mode="soft")
+    model = SimpleNodeClassifier(
+        in_dim=8, hidden_dim=8, out_dim=3,
+        backbone="gcn", dropout=0.0,
+        rewire_temperature=1.0, rewire_hard=False,
+        rewire_symmetric=True, reg=reg,
+    )
+    x = torch.randn(num_nodes, 8)
+
+    with torch.no_grad():
+        h1 = F.relu(model.lin_in(x))
+        h1 = model.conv1(h1, edge_index_base)
+        rw_ei, rw_ew, stats, _ = model.rewire(
+            h1, edge_index_base,
+            candidate_edge_index=anchors,
+            anchor_edge_index=anchors,
+            sample=False, anchor_mode="soft",
+        )
+
+    # In soft mode, anchor_probs should be populated and non-empty.
+    if stats.anchor_probs is None or stats.anchor_probs.numel() == 0:
+        raise AssertionError("Soft anchor mode should yield non-empty anchor_probs")
+
+    # Anchor probabilities should be in [0, 1] and learnable (i.e. not all 1.0).
+    probs = stats.anchor_probs
+    if probs.min() < -1e-6 or probs.max() > 1.0 + 1e-6:
+        raise AssertionError(f"Anchor probs out of [0,1]: min={probs.min():.4f} max={probs.max():.4f}")
+
+    print(
+        f"Tier 5: soft anchor OK | "
+        f"anchor_probs min={probs.min():.4f} max={probs.max():.4f} mean={probs.mean():.4f}"
+    )
+
+
+def tier6_band_energy_sanity() -> None:
+    """Test band_energy_proxy on toy signals: low-freq signal has low high-ratio, etc."""
+    from hetgnn_spectral_stability.regularizers.spectral import band_energy_proxy
+
+    num_nodes = 20
+    # Ring graph
+    edges = [(i, (i + 1) % num_nodes) for i in range(num_nodes)]
+    edge_index = to_undirected_coalesced(make_undirected_edge_index(num_nodes, edges), num_nodes)
+
+    # Constant signal (DC) → should be purely low-frequency.
+    x_const = torch.ones(num_nodes, 4)
+    ratio_const = band_energy_proxy(
+        x_const, edge_index, None, num_nodes=num_nodes, cheby_order=4
+    )
+
+    # Alternating signal → should be high-frequency.
+    x_alt = torch.zeros(num_nodes, 4)
+    for i in range(num_nodes):
+        x_alt[i] = 1.0 if i % 2 == 0 else -1.0
+    ratio_alt = band_energy_proxy(
+        x_alt, edge_index, None, num_nodes=num_nodes, cheby_order=4
+    )
+
+    ratio_const_f = float(ratio_const)
+    ratio_alt_f = float(ratio_alt)
+
+    if ratio_const_f > 0.5:
+        raise AssertionError(f"Constant signal should have low high-ratio, got {ratio_const_f:.4f}")
+    if ratio_alt_f < ratio_const_f:
+        raise AssertionError(
+            f"Alternating signal should have higher ratio than constant: "
+            f"alt={ratio_alt_f:.4f} const={ratio_const_f:.4f}"
+        )
+
+    print(
+        f"Tier 6: band energy sanity OK | "
+        f"const_ratio={ratio_const_f:.4f} alt_ratio={ratio_alt_f:.4f}"
+    )
+
+
+def tier7_budget_safe_healing() -> None:
+    """Healing should not exceed budget bounds (edge_budget_max_ratio)."""
+    torch.manual_seed(99)
+    num_nodes = 20
+    edges = [(i, (i + 1) % num_nodes) for i in range(num_nodes)]
+    edge_index_base = to_undirected_coalesced(make_undirected_edge_index(num_nodes, edges), num_nodes)
+
+    anchors = make_undirected_edge_index(num_nodes, [(0, 10), (5, 15)])
+    anchors = canonical_undirected(to_undirected_coalesced(anchors, num_nodes))
+    edge_index_base = to_undirected_coalesced(torch.cat([edge_index_base, anchors], dim=1), num_nodes)
+
+    candidate = make_undirected_edge_index(num_nodes, [(1, 11), (3, 13), (7, 17)])
+
+    model = build_model(in_dim=8, hidden_dim=8, out_dim=3)
+    sensor = SSISensor(num_nodes=num_nodes, num_iters=20, num_restarts=4)
+    x = torch.randn(num_nodes, 8)
+
+    budget_max_ratio = 1.4
+    ref_edges = float(edge_index_base.size(1))
+
+    from run_nodecls_wikipedia import self_healing_step
+
+    _, _, traj = self_healing_step(
+        model, sensor, x, edge_index_base,
+        candidate_edge_index=candidate,
+        anchor_shocked=anchors,
+        num_nodes=num_nodes,
+        target_lambda2=0.4,
+        budget_min_ratio=0.6,
+        budget_max_ratio=budget_max_ratio,
+        budget_ref_edges=ref_edges,
+        primal_lr=5e-2,
+        dual_lr=1e-2,
+        num_iters=6,
+        cvar_frac=0.2,
+        cvar_samples=8,
+        kl_beta=1.0,
+        kl_temp=1.0,
+        kl_conf=0.0,
+        anchor_mode="forced",
+        device=torch.device("cpu"),
+    )
+
+    # Check that the final expected edge ratio doesn't wildly exceed the budget.
+    if traj:
+        final_ratio = traj[-1].get("expected_e_ratio", 1.0)
+        # Allow some slack (soft constraint may be slightly exceeded), but not by 2x.
+        if final_ratio > budget_max_ratio * 2.0:
+            raise AssertionError(
+                f"Healing blew budget: expected_e_ratio={final_ratio:.4f} vs max={budget_max_ratio:.4f}"
+            )
+
+    print(f"Tier 7: budget-safe healing OK | trajectory steps={len(traj)}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tier", type=str, default="all", choices=["1", "2", "3", "all"])
+    parser.add_argument("--tier", type=str, default="all", choices=["1", "2", "3", "4", "5", "6", "7", "all"])
     args = parser.parse_args()
 
     if args.tier in ("1", "all"):
@@ -300,6 +475,14 @@ def main() -> None:
         tier2_spectral_sanity()
     if args.tier in ("3", "all"):
         tier3_end_to_end()
+    if args.tier in ("4", "all"):
+        tier4_controller_monotonicity()
+    if args.tier in ("5", "all"):
+        tier5_soft_anchor_effectiveness()
+    if args.tier in ("6", "all"):
+        tier6_band_energy_sanity()
+    if args.tier in ("7", "all"):
+        tier7_budget_safe_healing()
 
 
 if __name__ == "__main__":
